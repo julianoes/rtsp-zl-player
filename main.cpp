@@ -1,3 +1,4 @@
+#include <glib-unix.h>
 #include <gst/gst.h>
 
 #include <cstdio>
@@ -13,6 +14,7 @@ struct Player {
     GstElement* convert = nullptr;
     GstElement* sink = nullptr;
     GMainLoop* loop = nullptr;
+    guint sigint_id = 0;
 };
 
 void on_rtsp_pad_added(GstElement* /*src*/, GstPad* new_pad, gpointer user_data) {
@@ -64,6 +66,14 @@ void on_decoded_pad_added(GstElement* /*src*/, GstPad* new_pad, gpointer user_da
     gst_object_unref(sink_pad);
 }
 
+gboolean on_sigint(gpointer user_data) {
+    auto* p = static_cast<Player*>(user_data);
+    std::printf("\nInterrupt received, shutting down.\n");
+    p->sigint_id = 0; // second Ctrl+C falls through to default handler
+    g_main_loop_quit(p->loop);
+    return G_SOURCE_REMOVE;
+}
+
 gboolean on_bus_message(GstBus* /*bus*/, GstMessage* msg, gpointer user_data) {
     auto* p = static_cast<Player*>(user_data);
     switch (GST_MESSAGE_TYPE(msg)) {
@@ -71,9 +81,16 @@ gboolean on_bus_message(GstBus* /*bus*/, GstMessage* msg, gpointer user_data) {
             GError* err = nullptr;
             gchar* dbg = nullptr;
             gst_message_parse_error(msg, &err, &dbg);
-            std::fprintf(stderr, "ERROR from %s: %s\n",
-                         GST_OBJECT_NAME(msg->src), err->message);
-            if (dbg) std::fprintf(stderr, "  debug: %s\n", dbg);
+            const bool window_closed =
+                err->domain == GST_RESOURCE_ERROR && err->message &&
+                std::strstr(err->message, "Output window was closed") != nullptr;
+            if (window_closed) {
+                std::printf("Window closed, shutting down.\n");
+            } else {
+                std::fprintf(stderr, "ERROR from %s: %s\n",
+                             GST_OBJECT_NAME(msg->src), err->message);
+                if (dbg) std::fprintf(stderr, "  debug: %s\n", dbg);
+            }
             g_error_free(err);
             g_free(dbg);
             g_main_loop_quit(p->loop);
@@ -153,11 +170,13 @@ int main(int argc, char* argv[]) {
     p.loop = g_main_loop_new(nullptr, FALSE);
     GstBus* bus = gst_element_get_bus(p.pipeline);
     guint bus_id = gst_bus_add_watch(bus, on_bus_message, &p);
+    p.sigint_id = g_unix_signal_add(SIGINT, on_sigint, &p);
 
     std::printf("Playing %s\n", url);
     GstStateChangeReturn ret = gst_element_set_state(p.pipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         std::fprintf(stderr, "Failed to set pipeline to PLAYING.\n");
+        if (p.sigint_id) g_source_remove(p.sigint_id);
         g_source_remove(bus_id);
         gst_object_unref(bus);
         gst_element_set_state(p.pipeline, GST_STATE_NULL);
@@ -168,6 +187,7 @@ int main(int argc, char* argv[]) {
 
     g_main_loop_run(p.loop);
 
+    if (p.sigint_id) g_source_remove(p.sigint_id);
     g_source_remove(bus_id);
     gst_object_unref(bus);
     gst_element_set_state(p.pipeline, GST_STATE_NULL);
